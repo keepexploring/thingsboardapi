@@ -3,6 +3,9 @@ import jwt
 import json
 import psycopg2
 import time
+from falcon import HTTPUnauthorized
+from datetime import datetime, timedelta
+import yaml
 import pdb
 
 # to run in production:
@@ -10,20 +13,71 @@ import pdb
 
 # to run for testing:
 # hug -f thingsboard_api.py
+#config = configparser.ConfigParser()
+#config.read('init.ini')
+
+params = yaml.load(open('init.yaml', 'r') )
+
+JWT_OPTIONS = params['AUTH']['JWT_OPTIONS']
+SECRET_KEY = params['AUTH']['SECRET_KEY']
+JWT_ISSUER = params['AUTH']['JWT_ISSUER']
+JWT_AUDIENCE = params['AUTH']['JWT_AUDIENCE']
+JWT_OPTIONS_ALGORITHM = params['AUTH']['JWT_OPTIONS_ALGORITHM']
+
 
 try:
     conn = psycopg2.connect("dbname='thingsboard' user='thingsboard@thingsboard' host='thingsboard.postgres.database.azure.com' password='gsHExnKT7MrejZE3nF3ZKnJhNFA9'")
 except:
     print("I am unable to connect to the database")
 
-def token_verify(token):
-    secret_key = 'super-secret-key-please-change'
-    try:
-        return jwt.decode(token, secret_key, algorithm='HS256')
-    except jwt.DecodeError:
-        return False
 
-token_key_authentication = hug.authentication.token(token_verify)
+def jwt_token_verify(auth_header):
+    """
+    Verifier function for hug token authenticator
+    :param auth_header:
+    :return:
+    """
+    # Hug do not extract Bearer prefix
+    auth_token, payload = parse_header(auth_header)
+    return payload
+
+def parse_header(authorization_header, exception_class=HTTPUnauthorized):
+    """
+    Parses an authorization header. Accepts a custom Exception if any failure
+    :param authorization_header:
+    :param exception_class:
+    :return:
+    """
+    if authorization_header:
+        parts = authorization_header.split()
+
+        if parts[0].lower() != 'bearer' or len(parts) == 1 or len(
+                parts) > 2:
+            raise exception_class("invalid_header")
+
+        jwt_token = parts[1]
+        try:
+            # Decode token
+            payload = decode_token(jwt_token)
+            return jwt_token, payload
+        except jwt.ExpiredSignature:  # pragma: no cover
+            raise exception_class("token is expired")
+
+        except jwt.InvalidAudienceError:  # pragma: no cover
+            raise exception_class("incorrect audience")
+
+        except jwt.DecodeError:  # pragma: no cover
+            raise exception_class("token signature is invalid")
+
+        except jwt.InvalidIssuerError:  # pragma: no cover
+            raise exception_class("token issuer is invalid")
+
+        except Exception as exc:  # pragma: no cover
+            raise exception_class(exc)
+    else:  # pragma: no cover
+        raise exception_class("Authorization header not present")
+
+token_key_authentication = hug.authentication.token(jwt_token_verify)
 
 @hug.get('/get_customers', requires=token_key_authentication)
 def get_customers(hug_user):
@@ -120,22 +174,51 @@ def get_data(hug_user,device_id, startT, endT,keys=['PR']):
     #return { "PR":rows_PR,"SD":rows_SD,"RSSI":rows_RSSI } # just return like this to save doing more computations - do this on the other end
 
 
+def decode_token(token, options=JWT_OPTIONS):
+    """
+    Decodes a JWT token and returns payload info
+    :return:
+    """
+    return jwt.decode(
+        token,
+        SECRET_KEY,
+        issuer=JWT_ISSUER,
+        audience=JWT_AUDIENCE,
+        options=options,
+        algorithms=(JWT_OPTIONS_ALGORITHM,)
+    )
+
 
 @hug.get('/token_authenticated', requires=token_key_authentication)
 def token_auth_call(user: hug.directives.user):
-    #pdb.set_trace()
     return 'You are user: {0} with data {1}. Time was {2}'.format(user['user'], user['role'], user['time'])
 
 
 @hug.post('/token_generation') 
-def token_gen_call(username, password):
+def token_gen_call(username, password, exp=None):
     """Authenticate and return a token"""
     #pdb.set_trace()
-    secret_key = 'super-secret-key-please-change'
-    mockusername = 'User2'
-    mockpassword = 'Mypassword'
     
-    if mockpassword == password and mockusername == username: # example, don't do this in production
-        return {"token" : jwt.encode({'user': username, 'role': 'admin', 'time':time.time()}, secret_key, algorithm='HS256')}
+    username_set = params['AUTH']['username_set']
+    password_set = params['AUTH']['password_set']
+
+    """
+    Creates JWT Token
+    :return:
+    """
+    if exp is None:
+        exp = datetime.utcnow() + timedelta(seconds=3600)
+    _token = {
+        'aud': JWT_AUDIENCE,
+        'exp': exp,
+        'iss': JWT_ISSUER,
+        'user': username,
+        'role': 'admin',
+        'time':time.time()
+    }
+    _token.update(_token)
+    
+    if password_set == password and username_set == username: # example, don't do this in production
+        return {"token" : jwt.encode(_token, SECRET_KEY, algorithm=JWT_OPTIONS_ALGORITHM).decode('utf-8') }
     return 'Invalid username and/or password for user: {0}'.format(username)
 
